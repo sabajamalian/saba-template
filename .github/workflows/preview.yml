@@ -1,0 +1,110 @@
+name: PR Preview Environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  PREVIEW_RG: rg-preview-pr-${{ github.event.pull_request.number }}
+  PREVIEW_APP_NAME: app-saba-preview-pr-${{ github.event.pull_request.number }}
+  PREVIEW_COSMOS: cosmos-saba-preview-pr-${{ github.event.pull_request.number }}
+  PREVIEW_PLAN: plan-saba-preview-pr-${{ github.event.pull_request.number }}
+
+jobs:
+  deploy-preview:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Preview Infrastructure
+        id: infra
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: eastus
+          template: infra/main.bicep
+          parameters: >-
+            environmentName=preview-pr-${{ github.event.pull_request.number }}
+            cosmosDbName=${{ env.PREVIEW_COSMOS }}
+            appServicePlanName=${{ env.PREVIEW_PLAN }}
+            webAppName=${{ env.PREVIEW_APP_NAME }}
+          deploymentName: preview-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+
+      - name: Deploy App to Preview
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.PREVIEW_APP_NAME }}
+          package: .
+
+      - name: Comment PR with Preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const appName = process.env.PREVIEW_APP_NAME;
+            const url = `https://${appName}.azurewebsites.net`;
+            const body = `## Preview Environment\n\nDeployed successfully.\n\nURL: ${url}\n\nThis environment will be automatically destroyed when the PR is closed.`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes('## Preview Environment'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  teardown-preview:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete Preview Resource Group
+        run: |
+          az group delete \
+            --name ${{ env.PREVIEW_RG }} \
+            --yes \
+            --no-wait
